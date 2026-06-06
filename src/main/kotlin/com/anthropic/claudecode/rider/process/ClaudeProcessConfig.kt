@@ -186,6 +186,78 @@ object ClaudeProcessConfig {
     }
 
     /**
+     * Probes the available slash commands + skills the way the VS Code extension does:
+     * spawn a detached `claude` (no conversation channel), send a single
+     * `control_request {subtype:"initialize"}`, and read the `commands` array out of the
+     * matching `control_response`. Each entry is `{name, description, argumentHint}` — exactly
+     * the shape the webview's `/` picker expects. The process is killed as soon as the
+     * response arrives, so no conversation turn is ever run.
+     *
+     * Returns an empty array on any failure/timeout. Runs synchronously — call off the EDT.
+     */
+    fun probeSlashCommands(cwd: String): JsonArray {
+        val binary = resolveBinaryPath() ?: run {
+            log.warn("probeSlashCommands: claude binary not found")
+            return JsonArray(emptyList())
+        }
+
+        val cmd = mutableListOf<String>()
+        if (binary.endsWith(".cmd", ignoreCase = true) || binary.endsWith(".bat", ignoreCase = true)) {
+            cmd += listOf("cmd.exe", "/c", binary)
+        } else {
+            cmd += binary
+        }
+        cmd += listOf("--output-format", "stream-json", "--verbose", "--input-format", "stream-json")
+
+        val requestId = "rider-slash-probe"
+        var proc: Process? = null
+        return try {
+            val pb = ProcessBuilder(cmd)
+                .directory(File(cwd.takeIf { File(it).exists() } ?: SystemProperties.getUserHome()))
+                .redirectErrorStream(false)
+            pb.environment().putAll(buildEnvironment())
+            proc = pb.start()
+
+            // Watchdog: a hung CLI would block readLine() forever (the deadline below only
+            // fires between lines), so force-kill the process after the timeout to unblock it.
+            val watched = proc
+            val watchdog = Thread {
+                try { Thread.sleep(35_000) } catch (_: InterruptedException) { return@Thread }
+                if (watched.isAlive) watched.destroyForcibly()
+            }.apply { isDaemon = true; start() }
+
+            // Trigger the SDK-style initialize handshake; the CLI replies with a control_response
+            // whose payload carries the full command/skill catalog.
+            proc.outputStream.write(
+                ("""{"type":"control_request","request_id":"$requestId","request":{"subtype":"initialize"}}""" + "\n")
+                    .toByteArray(Charsets.UTF_8)
+            )
+            proc.outputStream.flush()
+
+            var commands = JsonArray(emptyList())
+            val reader = proc.inputStream.bufferedReader(Charsets.UTF_8)
+            val deadline = System.currentTimeMillis() + 30_000
+            while (System.currentTimeMillis() < deadline) {
+                val line = reader.readLine() ?: break
+                val obj = runCatching { Json.parseToJsonElement(line).jsonObject }.getOrNull() ?: continue
+                if (obj["type"]?.jsonPrimitive?.contentOrNull != "control_response") continue
+                val resp = obj["response"]?.jsonObject ?: continue
+                if (resp["request_id"]?.jsonPrimitive?.contentOrNull != requestId) continue
+                commands = resp["response"]?.jsonObject?.get("commands")?.jsonArray ?: JsonArray(emptyList())
+                break
+            }
+            watchdog.interrupt()
+            log.info("probeSlashCommands: harvested ${commands.size} command(s)/skill(s)")
+            commands
+        } catch (e: Exception) {
+            log.warn("probeSlashCommands failed: ${e.message}")
+            JsonArray(emptyList())
+        } finally {
+            proc?.destroyForcibly()
+        }
+    }
+
+    /**
      * Parses the human-readable `claude mcp list` output. Each server line looks like:
      *   `name: https://host/mcp (HTTP) - ✓ Connected`
      *   `claude.ai Gmail: https://.../mcp/v1 - ! Needs authentication`

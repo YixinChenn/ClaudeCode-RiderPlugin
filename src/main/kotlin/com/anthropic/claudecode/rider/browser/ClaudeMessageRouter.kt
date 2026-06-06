@@ -98,21 +98,13 @@ class ClaudeMessageRouter(
 
         when (reqType) {
             "init"                    -> handleInit(requestId)
-            "get_claude_state"        -> sendResponse(requestId, buildJsonObject {
+            "get_claude_state"        -> {
+                ensureSlashCommandsProbed()
+                sendResponse(requestId, buildJsonObject {
                     put("type", "get_claude_state_response")
-                    put("config", buildJsonObject {
-                        put("claudeSettings", buildJsonObject {
-                            put("effective", buildJsonObject {
-                                put("permissions", buildJsonObject {})
-                                put("model", JsonNull)
-                            })
-                            put("applied", buildJsonObject {})
-                            put("errors", JsonArray(emptyList()))
-                        })
-                        put("settings", buildJsonObject {})
-                        put("models", buildModelsArray())
-                    })
+                    put("config", buildClaudeConfig())
                 })
+            }
             "get_auth_status"         -> handleGetAuthStatus(requestId)
             "login"                   -> sendResponse(requestId, buildJsonObject {
                 put("type", "login_response")
@@ -178,6 +170,18 @@ class ClaudeMessageRouter(
     // ── init ────────────────────────────────────────────────────────────────
 
     private fun handleInit(requestId: String) {
+        val response = buildJsonObject {
+            put("type", "init_response")
+            put("state", buildInitState())
+        }
+        sendResponse(requestId, response)
+
+        // Push the current file context now that the React app is mounted and listening.
+        browserManager.sendCurrentFileContext()
+    }
+
+    /** The host "state" object the webview reads into `config.value` (init_response + update_state). */
+    private fun buildInitState(): JsonObject {
         val cwd = project.basePath ?: System.getProperty("user.home", "")
         val settings = ClaudeSettings.getInstance()
         val platform = when {
@@ -185,54 +189,125 @@ class ClaudeMessageRouter(
             SystemInfo.isMac     -> "mac"
             else                 -> "linux"
         }
+        return buildJsonObject {
+            put("defaultCwd", cwd)
+            put("openNewInTab", false)
+            put("showTerminalBanner", false)
+            put("showReviewUpsellBanner", false)
+            put("isOnboardingEnabled", false)
+            put("isOnboardingDismissed", true)
+            put("authStatus", buildJsonObject {
+                put("authMethod", "claudeai")
+                put("email", JsonNull)
+                put("subscriptionType", JsonNull)
+            })
+            put("modelSetting", settings.model)
+            put("thinkingLevel", settings.thinkingLevel)
+            put("initialPermissionMode", settings.initialPermissionMode)
+            put("allowDangerouslySkipPermissions", false)
+            put("platform", platform)
+            put("speechToTextEnabled", false)
+            put("speechToTextMicDenied", false)
+            put("marketplaceType", "none")
+            put("useCtrlEnterToSend", settings.useCtrlEnterToSend)
+            put("chromeMcpState", buildJsonObject { put("status", "disconnected") })
+            put("settings", buildJsonObject {})
+            // claudeSettings must have effective.permissions to avoid NPE in the webview
+            put("claudeSettings", buildJsonObject {
+                put("effective", buildJsonObject {
+                    put("permissions", buildJsonObject {})
+                    put("model", JsonNull)
+                })
+                put("applied", buildJsonObject {})
+                put("errors", JsonArray(emptyList()))
+            })
+            put("experimentGates", buildJsonObject {
+                // Enables the "Auto" permission mode in the webview's mode menu.
+                // Availability is further gated by the selected model's supportsAutoMode flag.
+                put("tengu_auto_mode_state", "enabled")
+            })
+            put("spinnerVerbsConfig", JsonNull)
+            put("currentRepo", JsonNull)
+        }
+    }
 
-        val response = buildJsonObject {
-            put("type", "init_response")
-            put("state", buildJsonObject {
-                put("defaultCwd", cwd)
-                put("openNewInTab", false)
-                put("showTerminalBanner", false)
-                put("showReviewUpsellBanner", false)
-                put("isOnboardingEnabled", false)
-                put("isOnboardingDismissed", true)
-                put("authStatus", buildJsonObject {
-                    put("authMethod", "claudeai")
-                    put("email", JsonNull)
-                    put("subscriptionType", JsonNull)
-                })
-                put("modelSetting", settings.model)
-                put("thinkingLevel", settings.thinkingLevel)
-                put("initialPermissionMode", settings.initialPermissionMode)
-                put("allowDangerouslySkipPermissions", false)
-                put("platform", platform)
-                put("speechToTextEnabled", false)
-                put("speechToTextMicDenied", false)
-                put("marketplaceType", "none")
-                put("useCtrlEnterToSend", settings.useCtrlEnterToSend)
-                put("chromeMcpState", buildJsonObject { put("status", "disconnected") })
-                put("settings", buildJsonObject {})
-                // claudeSettings must have effective.permissions to avoid NPE in the webview
-                put("claudeSettings", buildJsonObject {
-                    put("effective", buildJsonObject {
-                        put("permissions", buildJsonObject {})
-                        put("model", JsonNull)
-                    })
-                    put("applied", buildJsonObject {})
-                    put("errors", JsonArray(emptyList()))
-                })
-                put("experimentGates", buildJsonObject {
-                    // Enables the "Auto" permission mode in the webview's mode menu.
-                    // Availability is further gated by the selected model's supportsAutoMode flag.
-                    put("tengu_auto_mode_state", "enabled")
-                })
-                put("spinnerVerbsConfig", JsonNull)
-                put("currentRepo", JsonNull)
+    // ── slash commands / skills ───────────────────────────────────────────────
+
+    /**
+     * The `/` command + skill catalog, as `{name, description, argumentHint}` objects probed
+     * from the CLI's `initialize` handshake (see [ClaudeProcessConfig.probeSlashCommands]).
+     * This is the same data the VS Code extension's `loadConfig()` resolves into `config.commands`.
+     */
+    @Volatile private var cachedSlashCommands: JsonArray = JsonArray(emptyList())
+    /** Guards against launching more than one probe; the catalog is stable per session. */
+    private val slashCommandsProbeStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * The webview "claudeConfig" object (set from `get_claude_state` and `update_state`).
+     * Its `commands` array is the *only* source the React bundle reads to populate the
+     * `/` slash-command picker, so it must carry the probed command/skill catalog.
+     */
+    private fun buildClaudeConfig(): JsonObject = buildJsonObject {
+        put("claudeSettings", buildJsonObject {
+            put("effective", buildJsonObject {
+                put("permissions", buildJsonObject {})
+                put("model", JsonNull)
+            })
+            put("applied", buildJsonObject {})
+            put("errors", JsonArray(emptyList()))
+        })
+        put("settings", buildJsonObject {})
+        put("models", buildModelsArray())
+        put("commands", cachedSlashCommands)
+    }
+
+    /**
+     * Kicks off a one-time background probe of the slash command/skill catalog (mirrors the
+     * VS Code extension's `loadConfig()`/`spawnConfigProbe()`), then pushes the result to the
+     * webview as an `update_state`. The `/` picker registers commands reactively from
+     * `claudeConfig.commands`, so the push makes them appear without any user action.
+     */
+    private fun ensureSlashCommandsProbed() {
+        if (!slashCommandsProbeStarted.compareAndSet(false, true)) return
+        val cwd = project.basePath ?: System.getProperty("user.home", "")
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val commands = try {
+                ClaudeProcessConfig.probeSlashCommands(cwd)
+            } catch (e: Exception) {
+                log.warn("slash command probe failed: ${e.message}")
+                JsonArray(emptyList())
+            }
+            if (commands.isNotEmpty()) {
+                ApplicationManager.getApplication().invokeLater { pushSlashCommands(commands) }
+            } else {
+                // Allow a later retry (e.g. CLI installed after first open) on the next state fetch.
+                slashCommandsProbeStarted.set(false)
+            }
+        }
+    }
+
+    /**
+     * Caches the probed command catalog and pushes it to the webview. The envelope must match the
+     * VS Code extension's `pushStateUpdate()` exactly: a top-level `request` message whose inner
+     * `request.type` is "update_state", with `state` and `config` as siblings of `type` inside
+     * `request`. The webview dispatches on `request.type` and reads `$.request.state` /
+     * `$.request.config`. The state snapshot is rebuilt from persisted settings, so it faithfully
+     * mirrors current model/permission/thinking selections — only `commands` is genuinely new.
+     */
+    private fun pushSlashCommands(commands: JsonArray) {
+        cachedSlashCommands = commands
+        log.info("Pushing ${commands.size} slash command(s)/skill(s) to webview")
+        val message = buildJsonObject {
+            put("type", "request")
+            put("channelId", "")
+            put("requestId", java.util.UUID.randomUUID().toString())
+            put("request", buildJsonObject {
+                put("type", "update_state")
+                put("state", buildInitState())
+                put("config", buildClaudeConfig())
             })
         }
-        sendResponse(requestId, response)
-
-        // Push the current file context now that the React app is mounted and listening.
-        browserManager.sendCurrentFileContext()
+        browserManager.sendToWebview(message.toString())
     }
 
     // ── auth status ─────────────────────────────────────────────────────────
