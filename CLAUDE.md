@@ -15,7 +15,9 @@ This is a **JetBrains Rider IDE plugin** written in Kotlin that embeds the Claud
 ./gradlew verifyPlugin       # Verify plugin compatibility
 ```
 
-**Prerequisites**: Java 17+. The webview assets must be present at `src/main/resources/webview/index.js` and `index.css` (copied from the VS Code Claude Code extension).
+**Toolchain**: Kotlin 2.1.0 (JVM toolchain 17), Gradle 8.9, IntelliJ Platform Gradle plugin 2.6.0. Builds against Rider 2025.1 (`build.gradle.kts` falls back to a 2022.2.1 platform dependency if no local SDK is detected), while `plugin.xml` declares a 2022.2+ minimum. The only third-party runtime dependency is `kotlinx-serialization-json`.
+
+**Prerequisites**: Java 17+. The webview assets must be present at `src/main/resources/webview/index.js` and `index.css` (copied from the VS Code Claude Code extension). They are large (~4.6 MB JS, ~365 KB CSS) and not tracked in git.
 
 There are no automated tests — validation is done by running `./gradlew runIde`.
 
@@ -42,6 +44,7 @@ React Webview (JCEF)
 | `ClaudeToolWindowPanel` | `toolwindow/` | Swing panel hosting the JCEF browser |
 | `ClaudeBrowserManager` | `browser/` | JCEF lifecycle, theme/font injection, editor context sync |
 | `ClaudeMessageRouter` | `browser/` | JS→Kotlin IPC dispatcher (CefMessageRouter) |
+| `ClaudePlanPreviewPanel` | `browser/` | Standalone "Claude Plan" tool window; renders plan markdown in its own JCEF browser and bridges review comments |
 | `HtmlTemplateProvider` | `browser/` | Generates HTML shell + `acquireVsCodeApi()` shim |
 | `WebviewAssetProvider` | `browser/` | Extracts bundled `index.js`/`index.css` to temp dir |
 | `ClaudeProcessManager` | `process/` | Spawns `claude` subprocess, routes stream-JSON messages |
@@ -59,6 +62,18 @@ Claude CLI sends `control_request {subtype:"can_use_tool"}` on stdin. The plugin
 ### IDE Context Sync
 
 `ClaudeBrowserManager.setupEditorContextListener()` listens on `FileEditorManager` + `SelectionListener`. On tab switch or text selection change, it pushes active file path, language, line range, and selected text to the webview so Claude always sees the current editor state.
+
+### Editor Actions (`actions/` package)
+
+These bridge IDE gestures into the webview's input box via `ClaudeBrowserManager.insertAtMention()` (each first calls `notifyVisibility(true)` so the webview doesn't gate out the insertion):
+- `OpenClaudeAction` / `NewConversationAction` — open/focus the tool window or start a fresh conversation (the `Ctrl+Escape` / `Ctrl+Shift+Escape` bindings).
+- `ClaudeEditorActionGroup` — the editor right-click popup; builds `AskClaudeAction` entries.
+- `AskClaudeAction(text, prefix)` — sends the current selection prefixed with an instruction; disabled when there's no selection.
+- `SendFileAction` — inserts the current file's project-relative path as an `@`-mention; no selection needed.
+
+### Plan Preview & Review
+
+`ClaudePlanPreviewPanel` runs an independent JCEF browser in a separate "Claude Plan" tool window. `ClaudeMessageRouter` drives its lifecycle via RPC: `open_markdown_preview` (show), `close_plan_preview` (hide), `remove_plan_comment` (drop a comment by id). The panel renders plan markdown with a self-contained JS renderer; when comments are enabled, user-selected text + comment is sent back through a `JBCefJSQuery` and forwarded to the React webview via `ClaudeBrowserManager.sendPlanComment()`.
 
 ### Services and Lifecycle
 
