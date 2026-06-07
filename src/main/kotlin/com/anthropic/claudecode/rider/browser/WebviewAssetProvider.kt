@@ -76,8 +76,45 @@ object WebviewAssetProvider {
      *   Sessions loaded from disk always carry a host-provided summary (never blank — see
      *   ClaudeMessageRouter.readSessionSummary), so real history is unaffected; only the
      *   transient empty in-memory session is hidden until the user actually sends something.
+     *
+     * Patch — don't crash the conversation render on an unknown partial-stream case.
+     *   The bundle's SSE accumulator throws `Unhandled case: <obj>` (helper `ZB1`) from the
+     *   `default:` branch of two switches: the top-level stream-event type switch and the
+     *   content_block_delta `delta.type` switch. We launch `claude` with
+     *   `--include-partial-messages`, so when a newer CLI emits a stream event / delta type
+     *   this (older) bundle doesn't recognise, the throw bubbles up and the webview shows a
+     *   fatal "Unhandled case: [object Object]" banner, killing the whole turn's render.
+     *   Partial messages are purely a live-streaming preview; the authoritative complete
+     *   `assistant` message arrives separately, so skipping an unknown partial case is safe.
+     *
+     *   Fix: rewrite `ZB1` so the no-explicit-message path (the "Unhandled case" default)
+     *   warns and returns instead of throwing. Callers that pass an explicit message string
+     *   still throw — but there are none for this helper, and the unrelated
+     *   "Mismatched content block type" errors throw via `Error(...)` directly, so they are
+     *   unaffected. This is also forward-resilient to future stream-protocol additions.
      */
     private fun patchBundle(js: String): String {
+        var out = js
+        out = patchEmptyConversations(out)
+        out = patchUnhandledStreamCase(out)
+        return out
+    }
+
+    private fun patchUnhandledStreamCase(js: String): String {
+        val anchor = "function ZB1(\$,Z){throw Error(Z??`Unhandled case: \${\$}`)}"
+        val replacement = "function ZB1(\$,Z){if(Z!==void 0)throw Error(Z);" +
+            "try{console.warn(\"Claude(Rider): skipping unhandled partial-stream case\",\$&&\$.type)}catch(e){}}"
+        return if (js.contains(anchor)) {
+            log.info("Applied webview patch: unknown partial-stream cases are skipped instead of crashing the render")
+            js.replace(anchor, replacement)
+        } else {
+            log.warn("Webview patch 'unhandled-stream-case' not applied; bundle likely updated — " +
+                "an unknown stream event/delta type may still surface as 'Unhandled case: [object Object]'.")
+            js
+        }
+    }
+
+    private fun patchEmptyConversations(js: String): String {
         // Keep a session in the list only if it has messages or a non-empty summary/title.
         val keep = ".filter(e=>e.messages.value.length>0||e.summary.value)"
         // Two list builders read sessions.value directly: the history dropdown and the panel.
